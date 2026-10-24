@@ -129,12 +129,18 @@ def test_registry_uri_and_load_model(monkeypatch):
         }
     )
     configured = []
-    native_calls = []
+    load_calls = []
     sentinel = object()
 
     monkeypatch.setattr(registry, "configure_mlflow", configured.append)
 
-    fake_version = SimpleNamespace(run_id="test-run-123", version="7")
+    # storage_location contains /mlruns/ so _artifact_uri_from_version returns it directly.
+    fake_version = SimpleNamespace(
+        run_id="test-run-123",
+        version="7",
+        storage_location="/fake/mlruns/1/models/m-abc/artifacts",
+        source="models:/m-abc",
+    )
     fake_client = SimpleNamespace(
         get_model_version=lambda name, stage: fake_version,
         get_run=lambda run_id: SimpleNamespace(
@@ -144,14 +150,20 @@ def test_registry_uri_and_load_model(monkeypatch):
     monkeypatch.setattr(registry.mlflow, "MlflowClient", lambda: fake_client)
     monkeypatch.setattr(
         registry,
-        "_load_native",
-        lambda run_id, estimator: native_calls.append((run_id, estimator)) or sentinel,
+        "_load_by_uri",
+        lambda uri, estimator: load_calls.append((uri, estimator)) or sentinel,
+    )
+    # Simulate MLflow 3.x: _sqlite_storage_locations returns storage_location.
+    monkeypatch.setattr(
+        registry,
+        "_sqlite_storage_locations",
+        lambda uri: {"fare-v2": "/fake/mlruns/1/models/m-abc/artifacts"},
     )
 
     assert registry.model_uri("fare", config) == "models:/fare-v2/7"
     assert registry.load_model("fare", config) is sentinel
     assert configured == [config]
-    assert native_calls == [("test-run-123", "lightgbm")]
+    assert load_calls == [("/fake/mlruns/1/models/m-abc/artifacts", "lightgbm")]
 
 
 def test_registry_rebases_host_artifact_path_for_container(monkeypatch, tmp_path):
@@ -172,11 +184,14 @@ def test_registry_rebases_host_artifact_path_for_container(monkeypatch, tmp_path
     pyfunc_loaded = []
     sentinel = object()
 
+    # source contains /mlruns/ so _container_model_uri can rebase it to container_runs.
+    # No storage_location set → _artifact_uri_from_version returns source.
     fake_version = SimpleNamespace(
         name="fare-v2",
         version="7",
         run_id="test-run-abc",
         source="file:///C:/taxi-forecasting/mlruns/2/run-id/artifacts/model",
+        storage_location=None,
     )
     client = SimpleNamespace(
         search_model_versions=lambda query: [fake_version]
@@ -190,11 +205,11 @@ def test_registry_rebases_host_artifact_path_for_container(monkeypatch, tmp_path
     monkeypatch.setattr(registry, "configure_mlflow", lambda _config: None)
     monkeypatch.setattr(registry.mlflow, "MlflowClient", lambda: client)
 
-    # Primary _load_native raises; fallback uses pyfunc.load_model on the container path.
+    # Primary _load_by_uri raises; fallback uses pyfunc.load_model on the container path.
     monkeypatch.setattr(
         registry,
-        "_load_native",
-        lambda run_id, estimator: (_ for _ in ()).throw(
+        "_load_by_uri",
+        lambda uri, estimator: (_ for _ in ()).throw(
             MlflowException("Host artifact path is unavailable")
         ),
     )
