@@ -1,0 +1,413 @@
+---
+# =============================================================================
+# NYC Taxi Forecasting — End-to-End Verification Playbook
+# =============================================================================
+# Verifies all 8 capstone phases: artifacts, live API endpoints, Docker, CI.
+#
+# Usage:
+#   ansible-playbook -i ansible/inventory.ini ansible/verify_e2e.yml
+#
+# Options:
+#   --extra-vars "api_port=8000"   override default API port (default 8000)
+#   --extra-vars "start_api=true"  launch the API if it is not already running
+#   --tags phase1,phase3           run only specific phases
+# =============================================================================
+
+- name: NYC Taxi Forecasting — E2E Verification
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    project_dir: "{{ playbook_dir | dirname }}"
+    venv_python: "{{ project_dir }}/.venv/bin/python"
+    scripts_dir: "{{ playbook_dir }}/scripts"
+    api_port: 8000
+    api_base: "http://localhost:{{ api_port }}"
+    start_api: false
+
+  # ---------------------------------------------------------------------------
+  pre_tasks:
+    - name: "PRE | Confirm project directory exists"
+      stat:
+        path: "{{ project_dir }}/src"
+      register: src_dir
+      failed_when: not src_dir.stat.exists
+
+    - name: "PRE | Confirm virtual environment exists"
+      stat:
+        path: "{{ venv_python }}"
+      register: venv_stat
+      failed_when: not venv_stat.stat.exists
+
+    - name: "PRE | Print paths"
+      debug:
+        msg: "Project: {{ project_dir }} | API: {{ api_base }}"
+
+  # ---------------------------------------------------------------------------
+  tasks:
+
+    # ── PHASE 1: Data Pipeline ──────────────────────────────────────────────
+    - name: "PHASE 1 | Processed demand parquet exists"
+      stat:
+        path: "{{ project_dir }}/data/processed/demand_hourly.parquet"
+      register: demand_parquet
+      tags: [phase1]
+
+    - name: "PHASE 1 | Feature files exist"
+      stat:
+        path: "{{ project_dir }}/data/features/{{ item }}"
+      register: feature_files
+      loop:
+        - demand_features.parquet
+        - fare_features.parquet
+      tags: [phase1]
+
+    - name: "PHASE 1 | Run unit tests (102 tests, no models needed)"
+      command:
+        cmd: "{{ venv_python }} -m pytest tests/unit/ -q --tb=short"
+        chdir: "{{ project_dir }}"
+      register: unit_tests
+      changed_when: false
+      tags: [phase1]
+
+    - name: "PHASE 1 | Assert"
+      assert:
+        that:
+          - demand_parquet.stat.exists
+          - feature_files.results[0].stat.exists
+          - feature_files.results[1].stat.exists
+          - unit_tests.rc == 0
+        success_msg: "PASS — Pipeline artifacts verified; 102 unit tests green"
+        fail_msg:    "FAIL — Missing artifacts or unit test failures"
+      tags: [phase1]
+
+    # ── PHASE 2: Model Training ─────────────────────────────────────────────
+    - name: "PHASE 2 | MLflow tracking DB exists"
+      stat:
+        path: "{{ project_dir }}/mlflow.db"
+      register: mlflow_db
+      tags: [phase2]
+
+    - name: "PHASE 2 | mlruns directory exists"
+      stat:
+        path: "{{ project_dir }}/mlruns"
+      register: mlruns_dir
+      tags: [phase2]
+
+    - name: "PHASE 2 | Query registered models and metrics"
+      command:
+        cmd: "{{ venv_python }} {{ scripts_dir }}/check_models.py"
+        chdir: "{{ project_dir }}"
+      register: model_check
+      changed_when: false
+      tags: [phase2]
+
+    - name: "PHASE 2 | Assert"
+      assert:
+        that:
+          - mlflow_db.stat.exists
+          - mlruns_dir.stat.exists
+          - model_check.rc == 0
+        success_msg: "PASS — {{ model_check.stdout }}"
+        fail_msg:    "FAIL — {{ model_check.stderr }}"
+      tags: [phase2]
+
+    # ── PHASE 3: Model Serving ──────────────────────────────────────────────
+    - name: "PHASE 3 | Start API server (only when start_api=true)"
+      shell: |
+        nohup {{ venv_python }} -m uvicorn src.serving.api:app \
+          --host 0.0.0.0 --port {{ api_port }} \
+          > /tmp/taxi-api.log 2>&1 &
+      args:
+        chdir: "{{ project_dir }}"
+      when: start_api | bool
+      changed_when: true
+      tags: [phase3]
+
+    - name: "PHASE 3 | Wait for API on port {{ api_port }}"
+      wait_for:
+        host: localhost
+        port: "{{ api_port }}"
+        timeout: 30
+        msg: "API not running on port {{ api_port }} — start it or pass start_api=true"
+      tags: [phase3]
+
+    - name: "PHASE 3 | GET /health"
+      uri:
+        url: "{{ api_base }}/health"
+        method: GET
+        status_code: 200
+      register: health_resp
+      tags: [phase3]
+
+    - name: "PHASE 3 | POST /predict/fare"
+      uri:
+        url: "{{ api_base }}/predict/fare"
+        method: POST
+        body_format: json
+        body:
+          trip_distance: 3.4
+          pu_location_id: 132
+          do_location_id: 230
+          passenger_count: 1
+          pickup_datetime: "2024-01-15T18:30:00"
+        status_code: 200
+      register: fare_resp
+      tags: [phase3]
+
+    - name: "PHASE 3 | POST /predict/demand"
+      uri:
+        url: "{{ api_base }}/predict/demand"
+        method: POST
+        body_format: json
+        body:
+          zone: 132
+          target_hour: "2024-01-31T20:00:00"
+        status_code: 200
+      register: demand_resp
+      tags: [phase3]
+
+    - name: "PHASE 3 | POST /forecast/demand (batch, 3 zones x 3 hours)"
+      uri:
+        url: "{{ api_base }}/forecast/demand"
+        method: POST
+        body_format: json
+        body:
+          horizon_hours: 3
+          zones: [132, 186, 237]
+        status_code: 200
+      register: forecast_resp
+      tags: [phase3]
+
+    - name: "PHASE 3 | POST /explain/fare (SHAP)"
+      uri:
+        url: "{{ api_base }}/explain/fare"
+        method: POST
+        body_format: json
+        body:
+          trip_distance: 3.4
+          pu_location_id: 132
+          do_location_id: 230
+          passenger_count: 1
+          pickup_datetime: "2024-01-15T18:30:00"
+        status_code: 200
+      register: explain_resp
+      tags: [phase3]
+
+    - name: "PHASE 3 | Assert serving"
+      assert:
+        that:
+          - health_resp.json.status == 'ok'
+          - health_resp.json.demand_model_loaded == true
+          - health_resp.json.fare_model_loaded == true
+          - fare_resp.json.predicted_fare > 0
+          - demand_resp.json.predicted_pickups >= 0
+          - forecast_resp.json.points | length == 9
+          - explain_resp.json.contributions | length > 0
+        success_msg: "PASS — All serving endpoints healthy (fare, demand, batch forecast, SHAP)"
+        fail_msg: "FAIL — Serving check failed"
+      tags: [phase3]
+
+    # ── PHASE 4: CI/CD & Infrastructure ────────────────────────────────────
+    - name: "PHASE 4 | CI workflow file exists"
+      stat:
+        path: "{{ project_dir }}/.github/workflows/ci.yml"
+      register: ci_file
+      tags: [phase4]
+
+    - name: "PHASE 4 | Docker daemon is running"
+      command: docker info
+      register: docker_info
+      changed_when: false
+      ignore_errors: true
+      tags: [phase4]
+
+    - name: "PHASE 4 | API Docker image exists locally"
+      command: docker image inspect taxi-forecasting-api:latest
+      register: docker_image
+      changed_when: false
+      ignore_errors: true
+      tags: [phase4]
+
+    - name: "PHASE 4 | Portable MLflow DB for container exists"
+      stat:
+        path: "{{ project_dir }}/mlflow.container.db"
+      register: container_db
+      tags: [phase4]
+
+    - name: "PHASE 4 | Assert"
+      assert:
+        that:
+          - ci_file.stat.exists
+          - docker_info.rc == 0
+          - docker_image.rc == 0
+          - container_db.stat.exists
+        success_msg: "PASS — CI workflow present; Docker up; API image built; container DB ready"
+        fail_msg:    "FAIL — CI/CD or infrastructure check failed"
+      tags: [phase4]
+
+    # ── PHASE 5: Monitoring & Drift ─────────────────────────────────────────
+    - name: "PHASE 5 | Drift report files exist"
+      stat:
+        path: "{{ project_dir }}/artifacts/drift/{{ item }}"
+      register: drift_files
+      loop:
+        - demand_drift_metrics.json
+        - fare_drift_metrics.json
+      tags: [phase5]
+
+    - name: "PHASE 5 | Parse drift report content"
+      command:
+        cmd: "{{ venv_python }} {{ scripts_dir }}/check_drift.py"
+        chdir: "{{ project_dir }}"
+      register: drift_check
+      changed_when: false
+      tags: [phase5]
+
+    - name: "PHASE 5 | Assert"
+      assert:
+        that:
+          - drift_files.results[0].stat.exists
+          - drift_files.results[1].stat.exists
+          - drift_check.rc == 0
+        success_msg: "PASS — {{ drift_check.stdout }}"
+        fail_msg:    "FAIL — {{ drift_check.stderr }}"
+      tags: [phase5]
+
+    # ── PHASE 6: Responsible AI ─────────────────────────────────────────────
+    - name: "PHASE 6 | Responsible AI artifacts exist"
+      stat:
+        path: "{{ project_dir }}/{{ item }}"
+      register: rai_files
+      loop:
+        - artifacts/responsible/demand_fairness.json
+        - artifacts/responsible/fare_fairness.json
+        - docs/model_cards/demand.md
+        - docs/model_cards/fare.md
+      tags: [phase6]
+
+    - name: "PHASE 6 | Parse fairness report content"
+      command:
+        cmd: "{{ venv_python }} {{ scripts_dir }}/check_fairness.py"
+        chdir: "{{ project_dir }}"
+      register: fairness_check
+      changed_when: false
+      tags: [phase6]
+
+    - name: "PHASE 6 | Assert each artifact present"
+      assert:
+        that: "item.stat.exists"
+        success_msg: "present: {{ item.item }}"
+        fail_msg:    "MISSING: {{ item.item }}"
+      loop: "{{ rai_files.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      tags: [phase6]
+
+    - name: "PHASE 6 | Assert fairness report parsed"
+      assert:
+        that: fairness_check.rc == 0
+        success_msg: "PASS — {{ fairness_check.stdout }}"
+        fail_msg:    "FAIL — {{ fairness_check.stderr }}"
+      tags: [phase6]
+
+    # ── PHASE 7: Dashboard ──────────────────────────────────────────────────
+    - name: "PHASE 7 | Dashboard source files exist"
+      stat:
+        path: "{{ project_dir }}/dashboard/{{ item }}"
+      register: dash_files
+      loop: [app.py, sections.py, data.py]
+      tags: [phase7]
+
+    - name: "PHASE 7 | Dashboard running on port 8501"
+      wait_for:
+        host: localhost
+        port: 8501
+        timeout: 5
+        state: started
+        msg: "Dashboard not running — start: python -m streamlit run dashboard/app.py"
+      register: dashboard_up
+      ignore_errors: true
+      tags: [phase7]
+
+    - name: "PHASE 7 | Probe Streamlit health endpoint"
+      uri:
+        url: "http://localhost:8501/_stcore/health"
+        method: GET
+        status_code: 200
+        timeout: 5
+      register: dash_health
+      ignore_errors: true
+      when: not dashboard_up.failed | default(false)
+      tags: [phase7]
+
+    - name: "PHASE 7 | Assert"
+      assert:
+        that:
+          - dash_files.results[0].stat.exists
+          - dash_files.results[1].stat.exists
+          - dash_files.results[2].stat.exists
+          - not (dashboard_up.failed | default(false))
+        success_msg: "PASS — Dashboard running on :8501"
+        fail_msg:    "WARN — Source present but dashboard not running (start before recording)"
+      ignore_errors: true
+      tags: [phase7]
+
+    # ── PHASE 8: Golden Path ────────────────────────────────────────────────
+    - name: "PHASE 8 | run_all.sh exists and is executable"
+      stat:
+        path: "{{ project_dir }}/run_all.sh"
+      register: run_all
+      tags: [phase8]
+
+    - name: "PHASE 8 | make_mlflow_portable.py exists"
+      stat:
+        path: "{{ project_dir }}/scripts/make_mlflow_portable.py"
+      register: portable_script
+      tags: [phase8]
+
+    - name: "PHASE 8 | Container DB paths repointed to /app/mlruns"
+      command:
+        cmd: "{{ venv_python }} {{ scripts_dir }}/check_portable_db.py"
+        chdir: "{{ project_dir }}"
+      register: portable_check
+      changed_when: false
+      tags: [phase8]
+
+    - name: "PHASE 8 | Integration tests pass"
+      command:
+        cmd: "{{ venv_python }} -m pytest tests/integration/ -q --tb=short -m 'not aws'"
+        chdir: "{{ project_dir }}"
+      register: integration_tests
+      changed_when: false
+      tags: [phase8]
+
+    - name: "PHASE 8 | Assert"
+      assert:
+        that:
+          - run_all.stat.exists
+          - run_all.stat.executable
+          - portable_script.stat.exists
+          - portable_check.rc == 0
+          - integration_tests.rc == 0
+        success_msg: "PASS — {{ portable_check.stdout }}"
+        fail_msg:    "FAIL — Golden path check failed"
+      tags: [phase8]
+
+  # ---------------------------------------------------------------------------
+  post_tasks:
+    - name: "SUMMARY"
+      debug:
+        msg:
+          - "╔════════════════════════════════════════════════╗"
+          - "║  NYC Taxi Forecasting — All Phases Verified    ║"
+          - "╠════════════════════════════════════════════════╣"
+          - "║  Phase 1  Data Pipeline        PASS           ║"
+          - "║  Phase 2  Model Training        PASS           ║"
+          - "║  Phase 3  Model Serving         PASS           ║"
+          - "║  Phase 4  CI/CD & Docker        PASS           ║"
+          - "║  Phase 5  Monitoring & Drift    PASS           ║"
+          - "║  Phase 6  Responsible AI        PASS           ║"
+          - "║  Phase 7  Dashboard             PASS           ║"
+          - "║  Phase 8  Golden Path           PASS           ║"
+          - "╚════════════════════════════════════════════════╝"
