@@ -32,9 +32,10 @@ _TARGETS = [
     ("model_versions", "storage_location"),
 ]
 
-# Matches everything up to and including the ``/mlruns`` segment of a file URI,
-# e.g. ``file:///C:/taxi-forecasting/mlruns`` or ``file:///app/mlruns``.
-_PREFIX_RE = re.compile(r"^file://.*?/mlruns", re.IGNORECASE)
+# Matches everything up to and including the ``/mlruns`` segment.
+# Handles both file:// URIs (Windows paths: ``file:///C:/...``) and bare
+# absolute POSIX paths (``/Users/.../mlruns``) produced on macOS/Linux.
+_PREFIX_RE = re.compile(r"^(?:file://)?.*?/mlruns", re.IGNORECASE)
 
 
 def _column_exists(conn: sqlite3.Connection, table: str, column: str) -> bool:
@@ -49,7 +50,7 @@ def repoint(conn: sqlite3.Connection, new_base: str) -> int:
         if not _column_exists(conn, table, column):
             continue
         rows = conn.execute(
-            f"SELECT rowid, {column} FROM {table} WHERE {column} LIKE 'file:%mlruns%'"
+            f"SELECT rowid, {column} FROM {table} WHERE {column} LIKE '%mlruns%'"
         ).fetchall()
         for rowid, value in rows:
             new_value = _PREFIX_RE.sub(new_base, value)

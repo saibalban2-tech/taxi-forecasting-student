@@ -129,19 +129,29 @@ def test_registry_uri_and_load_model(monkeypatch):
         }
     )
     configured = []
-    loaded = []
+    native_calls = []
     sentinel = object()
+
     monkeypatch.setattr(registry, "configure_mlflow", configured.append)
+
+    fake_version = SimpleNamespace(run_id="test-run-123", version="7")
+    fake_client = SimpleNamespace(
+        get_model_version=lambda name, stage: fake_version,
+        get_run=lambda run_id: SimpleNamespace(
+            data=SimpleNamespace(tags={"estimator": "lightgbm"})
+        ),
+    )
+    monkeypatch.setattr(registry.mlflow, "MlflowClient", lambda: fake_client)
     monkeypatch.setattr(
-        registry.mlflow,
-        "sklearn",
-        SimpleNamespace(load_model=lambda uri: loaded.append(uri) or sentinel),
+        registry,
+        "_load_native",
+        lambda run_id, estimator: native_calls.append((run_id, estimator)) or sentinel,
     )
 
     assert registry.model_uri("fare", config) == "models:/fare-v2/7"
     assert registry.load_model("fare", config) is sentinel
     assert configured == [config]
-    assert loaded == ["models:/fare-v2/7"]
+    assert native_calls == [("test-run-123", "lightgbm")]
 
 
 def test_registry_rebases_host_artifact_path_for_container(monkeypatch, tmp_path):
@@ -159,35 +169,43 @@ def test_registry_rebases_host_artifact_path_for_container(monkeypatch, tmp_path
     container_runs = tmp_path / "mlruns"
     model_path = container_runs / "2" / "run-id" / "artifacts" / "model"
     model_path.mkdir(parents=True)
-    loaded = []
+    pyfunc_loaded = []
     sentinel = object()
 
-    def fake_load_model(uri):
-        loaded.append(uri)
-        if uri.startswith("models:/"):
-            raise MlflowException("Host artifact path is unavailable")
-        return sentinel
-
+    fake_version = SimpleNamespace(
+        name="fare-v2",
+        version="7",
+        run_id="test-run-abc",
+        source="file:///C:/taxi-forecasting/mlruns/2/run-id/artifacts/model",
+    )
     client = SimpleNamespace(
-        search_model_versions=lambda query: [
-            SimpleNamespace(
-                name="fare-v2",
-                version="7",
-                source="file:///C:/taxi-forecasting/mlruns/2/run-id/artifacts/model",
-            )
-        ]
+        search_model_versions=lambda query: [fake_version]
         if query == "name='fare-v2'"
-        else []
+        else [],
+        get_run=lambda run_id: SimpleNamespace(
+            data=SimpleNamespace(tags={"estimator": "lightgbm"})
+        ),
     )
     monkeypatch.setattr(registry, "_CONTAINER_MLRUNS", container_runs)
     monkeypatch.setattr(registry, "configure_mlflow", lambda _config: None)
     monkeypatch.setattr(registry.mlflow, "MlflowClient", lambda: client)
+
+    # Primary _load_native raises; fallback uses pyfunc.load_model on the container path.
     monkeypatch.setattr(
-        registry.mlflow, "sklearn", SimpleNamespace(load_model=fake_load_model)
+        registry,
+        "_load_native",
+        lambda run_id, estimator: (_ for _ in ()).throw(
+            MlflowException("Host artifact path is unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        registry.mlflow,
+        "pyfunc",
+        SimpleNamespace(load_model=lambda uri: pyfunc_loaded.append(uri) or sentinel),
     )
 
     assert registry.load_model("fare", config) is sentinel
-    assert loaded == ["models:/fare-v2/latest", model_path.as_uri()]
+    assert pyfunc_loaded == [model_path.as_uri()]
 
 
 def test_load_demand_history_normalizes_timestamp(tmp_path):

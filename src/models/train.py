@@ -32,6 +32,23 @@ logger = logging.getLogger(__name__)
 _HIGHER_IS_BETTER = {"r2"}
 
 
+def _log_model(model, estimator: str) -> None:
+    """Log a trained model using the appropriate native MLflow flavor.
+
+    Using the native XGBoost / LightGBM flavors avoids the skops trusted-type
+    requirement introduced in recent MLflow releases when serialising those
+    estimators through the generic sklearn flavour.
+    """
+    if estimator == "xgboost":
+        import mlflow.xgboost as mlflow_xgb
+        mlflow_xgb.log_model(model, artifact_path="model")
+    elif estimator == "lightgbm":
+        import mlflow.lightgbm as mlflow_lgbm
+        mlflow_lgbm.log_model(model, artifact_path="model")
+    else:
+        mlflow.sklearn.log_model(model, artifact_path="model")
+
+
 def _is_better(metric: str, candidate: float, incumbent: float) -> bool:
     if metric in _HIGHER_IS_BETTER:
         return candidate > incumbent
@@ -101,7 +118,8 @@ def train_problem(
             mlflow.log_params(best_params)
             mlflow.log_metrics({f"val_{k}": v for k, v in val_metrics.items()})
             mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
-            mlflow.sklearn.log_model(model, artifact_path="model")
+            mlflow.set_tag("estimator", estimator)
+            _log_model(model, estimator)
             run_id = run.info.run_id
 
         logger.info(

@@ -58,17 +58,48 @@ def _container_model_uri(problem: str, config: Config) -> str:
     return path.as_uri()
 
 
+def _load_native(run_id: str, estimator: str) -> object:
+    """Load a model artifact from a run using the appropriate native flavor."""
+    uri = f"runs:/{run_id}/model"
+    if estimator == "xgboost":
+        return mlflow.xgboost.load_model(uri)
+    if estimator == "lightgbm":
+        return mlflow.lightgbm.load_model(uri)
+    # Fallback: generic sklearn flavor (skops path)
+    return mlflow.sklearn.load_model(uri)
+
+
+def _estimator_from_run(client: mlflow.MlflowClient, run_id: str) -> str:
+    """Return the 'estimator' tag recorded on a training run, or 'sklearn'."""
+    try:
+        run = client.get_run(run_id)
+        return run.data.tags.get("estimator", "sklearn")
+    except Exception:
+        return "sklearn"
+
+
 def load_model(problem: str, config: Config | None = None):
     """Load the registered model for ``problem`` from the MLflow registry."""
     config = config or get_config()
     configure_mlflow(config)
-    uri = model_uri(problem, config)
-    logger.info("Loading model for %s from %s", problem, uri)
+    name = registry_model_name(problem, config)
+    stage = str(config.serving.get("model_stage", "latest"))
+    logger.info("Loading model for %s (name=%s stage=%s)", problem, name, stage)
+
+    client = mlflow.MlflowClient()
     try:
-        return mlflow.sklearn.load_model(uri)
+        if stage.isdigit():
+            version = client.get_model_version(name, stage)
+        else:
+            versions = client.search_model_versions(f"name='{name}'")
+            if not versions:
+                raise MlflowException(f"No registered versions found for {name}")
+            version = max(versions, key=lambda v: int(v.version))
+        estimator = _estimator_from_run(client, version.run_id)
+        return _load_native(version.run_id, estimator)
     except (MlflowException, OSError):
         if not _CONTAINER_MLRUNS.is_dir():
             raise
         container_uri = _container_model_uri(problem, config)
         logger.info("Retrying %s model from mounted artifact %s", problem, container_uri)
-        return mlflow.sklearn.load_model(container_uri)
+        return mlflow.pyfunc.load_model(container_uri)
