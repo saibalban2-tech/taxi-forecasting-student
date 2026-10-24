@@ -14,7 +14,8 @@ from clients.python.taxi_client import TaxiClient
 
 def _client(test_client) -> TaxiClient:
     # Empty base_url so paths like "/health" are sent as-is to the TestClient.
-    return TaxiClient(base_url="", session=test_client)
+    # timeout=None keeps the deprecated timeout kwarg off TestClient calls.
+    return TaxiClient(base_url="", timeout=None, session=test_client)
 
 
 def test_client_health(client):

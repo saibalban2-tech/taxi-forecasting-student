@@ -33,7 +33,7 @@ class TaxiClient:
         self,
         base_url: str = "http://localhost:8000",
         *,
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = DEFAULT_TIMEOUT,
         session: requests.Session | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -41,14 +41,19 @@ class TaxiClient:
         self._session = session or requests.Session()
 
     # -- internal helpers ----------------------------------------------------
+    def _request_kwargs(self) -> dict[str, Any]:
+        # Only send `timeout` when set: injected sessions such as FastAPI's
+        # TestClient deprecate the argument (it is meaningless in-process).
+        return {} if self.timeout is None else {"timeout": self.timeout}
+
     def _get(self, path: str) -> dict[str, Any]:
-        resp = self._session.get(f"{self.base_url}{path}", timeout=self.timeout)
+        resp = self._session.get(f"{self.base_url}{path}", **self._request_kwargs())
         resp.raise_for_status()
         return resp.json()
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         resp = self._session.post(
-            f"{self.base_url}{path}", json=payload, timeout=self.timeout
+            f"{self.base_url}{path}", json=payload, **self._request_kwargs()
         )
         resp.raise_for_status()
         return resp.json()

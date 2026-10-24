@@ -5,6 +5,9 @@ pythonpath = ["."]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::FutureWarning",
+    # shap uses soon-to-be-deprecated matplotlib colormap APIs internally;
+    # the fix has to come from a shap release, not our code.
+    "ignore::PendingDeprecationWarning:shap",
 ]
 
 [tool.coverage.run]
