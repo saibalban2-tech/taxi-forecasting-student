@@ -27,8 +27,13 @@ mlruns/
 mlflow.db
 *.db
 
-# Models / outputs
-artifacts/
+# Models / outputs — keep evidence reports, ignore large training artefacts
+artifacts/demand/
+artifacts/fare/
+artifacts/drift/*.png
+artifacts/responsible/*.png
+!artifacts/drift/*.json
+!artifacts/responsible/*.json
 *.pkl
 *.joblib
 

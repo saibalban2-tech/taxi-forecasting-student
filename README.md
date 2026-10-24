@@ -1,75 +1,185 @@
-# Taxi Forecasting
+# NYC Taxi Forecasting — MLOps Capstone
 
-Python application for two NYC taxi prediction tasks:
+End-to-end MLOps platform for two NYC Yellow Taxi prediction tasks:
 
-- **Demand:** pickup count for one pickup zone and hour.
-- **Fare:** `fare_amount` for one trip, not the full passenger bill.
+- **Demand:** hourly pickup count per taxi zone (XGBoost / LightGBM, recursive multi-hour forecast)
+- **Fare:** `fare_amount` per trip (XGBoost / LightGBM, booking-time estimate)
 
-The repository includes data processing, XGBoost/LightGBM training, MLflow
-tracking, FastAPI serving, recursive batch forecasts, SHAP explanations,
-subgroup evaluation, drift detection, a Streamlit dashboard, and optional AWS
-infrastructure templates. It contains no datasets or trained model bundles.
+Covers every production phase: data ingestion → cleaning → feature engineering → hyperparameter tuning (Optuna) → MLflow tracking & registry → FastAPI serving → batch forecasting → CI/CD → drift detection → responsible AI (SHAP + fairness) → Streamlit dashboard.
 
-## Start Locally
+---
 
-For the preinstalled Windows course image, follow the
-[AWS account and image-access guide](docs/STUDENT_AWS_IMAGE_ACCESS.md) instead of
-recreating the environment with the local-install commands below.
+## Quick Start (Local)
 
-Use Python 3.11. From the repository root on Windows PowerShell:
+### Prerequisites
+- Python 3.11
+- Docker (for container demo)
+- ~4 GB disk space for data + models
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m pytest
+### 1 — Environment
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -r requirements-dashboard.txt
 ```
 
-Tests use synthetic data and do not require downloads, models or AWS access.
-Follow [setup](docs/SETUP.md) to download data, train registered models, and
-start the API and dashboard. Do not expect working predictions immediately
-after cloning: serving requires both registered models and saved demand history.
+### 2 — Run the full pipeline (one command)
 
-## Documentation
+```bash
+./run_all.sh
+```
 
-- [Request and launch the Windows course image](docs/STUDENT_AWS_IMAGE_ACCESS.md)
-- [Local setup and commands](docs/SETUP.md)
-- [API request examples](docs/API_EXAMPLES.md)
-- [System architecture](docs/ARCHITECTURE.md)
-- [Data scope and model limitations](docs/DATA_STATEMENT.md)
-- [Optional AWS infrastructure](infra/terraform/README.md)
-- [Recording companion and learner activity map](docs/RECORDING_COMPANION.md)
-- [Recorded architecture walkthrough](docs/PROJECT_ARCHITECTURE.md)
-- [Historical business report](docs/BUSINESS_REPORT.md)
-- [Cloud cost boundaries](docs/COST_OPTIMIZATION.md)
+This executes all 8 phases end-to-end from a clean state:
+data pipeline → model training → serving smoke test → drift reports → responsible AI → golden-path verification.
 
-The companion links all L2-L12 learner labs; L1 uses setup and tests. Videos are
-provided separately. Lab files, reviewed diagrams, and the exploration notebook
-retain the paths shown in the recordings. The notebook has no saved outputs.
-Datasets, trained models, and evidence reports must be generated locally; AWS
-activities require your own authorized configuration or the stated local fallback.
+### 3 — Run phases individually
 
-## Layout
+```bash
+# Phase 1: Data pipeline
+python -m scripts.run_pipeline
+
+# Phase 2: Model training (--n-trials 5 for speed; default 25 for full quality)
+python -m scripts.train_models --n-trials 5
+
+# Phase 3: Start the API
+python -m uvicorn src.serving.api:app --port 8000
+
+# Phase 5: Generate drift report
+python -m scripts.monitoring.demo_drift_report --problem all --mode drift
+
+# Phase 6: Responsible AI analysis
+python -m scripts.responsible.run_analysis
+
+# Phase 7: Start the dashboard (requires API running on :8000)
+python -m streamlit run dashboard/app.py --server.port 8501
+
+# Phase 8: Make MLflow DB portable for Docker, then run containers
+python scripts/make_mlflow_portable.py
+docker compose -f docker/docker-compose.yml up --build
+```
+
+### 4 — Run tests
+
+```bash
+python -m pytest tests/unit/    # 102 unit tests, no network/model required
+python -m pytest tests/         # + integration smoke tests
+```
+
+---
+
+## API Reference
+
+Once the API is running on `http://localhost:8000`:
+
+```bash
+# Health
+curl http://localhost:8000/health
+
+# Fare prediction
+curl -X POST http://localhost:8000/predict/fare \
+  -H "Content-Type: application/json" \
+  -d '{"trip_distance":3.4,"pu_location_id":132,"do_location_id":230,
+       "passenger_count":1,"pickup_datetime":"2024-01-15T18:30:00"}'
+
+# Demand prediction
+curl -X POST http://localhost:8000/predict/demand \
+  -H "Content-Type: application/json" \
+  -d '{"zone":132,"target_hour":"2024-01-31T20:00:00"}'
+
+# Recursive batch forecast (6 hours, 3 zones)
+curl -X POST http://localhost:8000/forecast/demand \
+  -H "Content-Type: application/json" \
+  -d '{"horizon_hours":6,"zones":[132,186,237]}'
+
+# SHAP explanation
+curl -X POST http://localhost:8000/explain/fare \
+  -H "Content-Type: application/json" \
+  -d '{"trip_distance":3.4,"pu_location_id":132,"do_location_id":230,
+       "passenger_count":1,"pickup_datetime":"2024-01-15T18:30:00"}'
+
+# Swagger UI
+open http://localhost:8000/docs
+```
+
+---
+
+## CI/CD
+
+GitHub Actions workflow at `.github/workflows/ci.yml`:
+
+| Job | What it checks |
+|-----|---------------|
+| `lint` | `ruff check` across all source |
+| `unit-tests` | 102 unit tests, ≥ 75 % coverage gate |
+| `integration-tests` | API + pipeline smoke tests (offline, synthetic data) |
+| `docker-build-api` | Dockerfile builds cleanly (builder stage; model artefacts trained locally) |
+| `docker-build-dashboard` | Full dashboard image build (reads committed artefacts) |
+
+---
+
+## Docker
+
+```bash
+# After running training (mlruns/ and mlflow.container.db must exist):
+python scripts/make_mlflow_portable.py
+docker compose -f docker/docker-compose.yml up --build
+
+# Services:
+#   API      → http://localhost:8000  (Swagger at /docs)
+#   MLflow UI → http://localhost:5000
+
+# Dashboard container:
+docker build -f docker/Dockerfile.dashboard -t taxi-dashboard .
+docker run -p 8501:8501 -e API_BASE_URL=http://host.docker.internal:8000 taxi-dashboard
+```
+
+---
+
+## Project Layout
 
 | Path | Responsibility |
-| --- | --- |
-| `src/data/`, `src/features/` | Download, clean, aggregate, engineer features, and split by time |
-| `src/models/` | Tune, train, evaluate, explain, and register models |
-| `src/serving/`, `clients/python/` | API contracts, inference, batch forecasting, and HTTP client |
-| `src/monitoring/`, `src/responsible/` | Drift, performance comparisons, SHAP, and subgroup metrics |
-| `scripts/` | Technical command entrypoints |
-| `dashboard/` | Streamlit views calling the API and reading local reports |
-| `tests/` | Offline unit and integration checks |
-| `notebooks/`, `docs/` | Data exploration, learner activities, and technical references |
-| `docker/`, `infra/terraform/`, `retraining/` | Optional packaging and cloud operation |
+|------|---------------|
+| `src/data/` | Ingest, clean, aggregate, split |
+| `src/features/` | Calendar, demand lags/rolling, fare features |
+| `src/models/` | Optuna tuning, train, evaluate, SHAP, model card |
+| `src/serving/` | FastAPI app, inference, batch forecast, registry |
+| `src/monitoring/` | Capture parsing, PSI + KS drift, performance comparison |
+| `src/responsible/` | SHAP explainability, subgroup fairness |
+| `src/aws/` | S3 helpers, SageMaker processor wrappers |
+| `dashboard/` | Streamlit showcase (6 sections) |
+| `scripts/` | CLI entry points for every phase |
+| `tests/` | 102 unit tests + integration smoke tests |
+| `docker/` | Dockerfile (API), Dockerfile.dashboard, docker-compose |
+| `infra/terraform/` | Optional AWS infrastructure templates |
+| `.github/workflows/` | CI/CD pipeline |
+| `run_all.sh` | Golden-path end-to-end orchestration script |
 
-## Operational Boundaries
+---
 
-Docker, Terraform and AWS are optional for local operation. The cloud templates
-are not connected to any account, remote repository or existing deployment.
-They can create billable resources if you explicitly deploy them with credentials.
-No GitHub Actions workflows or automatic release hooks are configured here.
+## Model Results (Jan 2024 TLC data)
 
-Historical evaluation does not establish current production quality. The default
-forecast follows the latest stored history, not the current clock. Model errors,
-duration estimation, drift and subgroup disparities require review before using
-predictions to make operational or financial decisions.
+| Problem | Algorithm | Val RMSE | Test RMSE | Test R² |
+|---------|-----------|----------|-----------|---------|
+| Demand (pickups/hour/zone) | LightGBM | 8.38 | 8.59 | 0.971 |
+| Fare (USD) | LightGBM | 3.37 | 3.47 | 0.955 |
+
+Tuned with Optuna TPE (5–25 trials per estimator), selected by validation RMSE on a strict chronological 80/10/10 split.
+
+---
+
+## Monitoring & Responsible AI
+
+- **Drift**: PSI (threshold 0.2) + KS test per feature. Reports in `artifacts/drift/`.
+- **Fairness**: Disparity ratio (worst/best RMSE) across borough, time-of-day, weekend, airport zones. Flagged > 1.5×.
+- **Explainability**: SHAP `TreeExplainer` — global summaries in `artifacts/responsible/`, per-request contributions via `/explain/*` API.
+- **Model cards**: `docs/model_cards/demand.md`, `docs/model_cards/fare.md`.
+
+---
+
+## Notes
+
+- `mlruns/`, `mlflow.db`, and `data/` are gitignored — run the pipeline locally to generate them.
+- AWS, Docker, and Terraform are **optional**. All phases work fully offline.
+- The dashboard connects to the API over HTTP; start the API before the dashboard.
