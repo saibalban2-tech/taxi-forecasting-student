@@ -12,6 +12,7 @@ htmlcov/
 
 # Raw / intermediate data not needed for serving.
 data/raw/
+!data/raw/taxi_zone_lookup.csv
 data/features/
 # From processed/, keep only the demand-history parquet used at inference.
 data/processed/*
