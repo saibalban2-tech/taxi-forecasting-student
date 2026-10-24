@@ -18,6 +18,7 @@ env/
 
 # Data artifacts (kept out of VCS)
 data/raw/*
+!data/raw/taxi_zone_lookup.csv
 data/processed/*
 data/features/*
 !data/**/.gitkeep
